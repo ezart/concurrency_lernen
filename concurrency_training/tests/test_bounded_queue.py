@@ -155,6 +155,57 @@ class BoundedQueueTest(unittest.TestCase):
         self.assertTrue(set(consumed) == set(produced))
 
 
+    def test_consumer_blocks_when_empty(self):
+        """
+        wait()
+        ↓
+        Consumer has reached the checkpoint
+        ↓
+        done() == False
+        ↓
+        Consumer has not finished
+        ↓
+        Queue is empty
+        ↓
+        Therefore consumer is blocked waiting for an item
+        """
+        # create empty queue, capacity = 2
+        q = BoundedQueue(capacity=2)
+
+    
+        consumer_started = threading.Event()
+
+        def consumer_worker()->int:
+            consumer_started.set()
+            item = q.get()
+            consumer_started.clear()
+            return item
+
+            
+            
+
+        def producer_woker():
+            q.put(2)
+
+
+        with ThreadPoolExecutor() as executor:
+            consumer_future = executor.submit(consumer_worker)
+            # wait for consumer started event
+            self.assertTrue(consumer_started.wait(timeout=1.0))
+            self.assertFalse(consumer_future.done())
+
+            producer_future =executor.submit(producer_woker)
+            
+            # wait for both tasks to finish
+            producer_future.result()
+            value = consumer_future.result(timeout=1.0)
+            
+            self.assertEqual(value,2,"Result of consumer worker should be what was added by producer worker")
+            self.assertFalse(consumer_started.is_set())
+
+
+
+
 
 
 
