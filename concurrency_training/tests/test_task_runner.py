@@ -83,6 +83,7 @@ class TaskRunnerTest(unittest.TestCase):
         self.assertEqual(runner.submit(pow, 2, 3).result(), 8)
 
         runner.shutdown()
+        runner.shutdown() 
 
         with self.assertRaises(RuntimeError):
             runner.submit(pow, 2, 3)
