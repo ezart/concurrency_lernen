@@ -17,6 +17,7 @@ class DependencyScheduler:
         Done = "Done"
         Failed = "Failed"
         Pending = "Pending"
+        Canceled = "Canceled"
 
     def __init__(self, max_workers: int):
         if max_workers < 1:
@@ -130,15 +131,18 @@ class DependencyScheduler:
         # run functions
         def execute(task_id):
             task = self.task_ids[task_id]
-            for t in task["depends_on"]:
-                status = task["status"]
-                if status == self.Status.Pending:
-                    raise RuntimeError("Task dependency failed")
-                elif status == self.Status.Failed:
-                    break
-            future = self.executor.submit(task["fn"], *task["args"], **task["kwargs"])
-            task["status"] = self.Status.Done
-            return future.result()
+            if task["status"] != self.Status.Canceled:
+                for t in task["depends_on"]:
+                    status = task["status"]
+                    if status == self.Status.Pending:
+                        raise RuntimeError("Task dependency failed")
+                    elif status == self.Status.Failed or status == self.Status.Canceled:
+                        break
+                future = self.executor.submit(task["fn"], *task["args"], **task["kwargs"])
+                task["status"] = self.Status.Done
+                return future.result()
+            else:
+                print(f"Task {task_id} canceled")
 
         for t in tasks:
             self.results[t] = execute(t)
