@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+import threading
 from threading import Event
 from unittest import TestCase
 from unittest.mock import patch
@@ -162,3 +163,275 @@ class ConcurrentBatchProcessorTest(TestCase):
 
             # Verify cleanup even though submission failed.
             mock_executor.return_value.__exit__.assert_called_once()
+
+    # TEST 5 — Parallel banking service calls
+    def test_parallel_banking_service_lookups(self):
+        """
+        Simulate independent balance, customer profile,
+        and loan eligibility service calls.
+
+        All three must start before any is released.
+        """
+        started = {name: threading.Event() for name in ("balance", "profile", "loan")}
+        release = threading.Event()
+
+        def service_call(name, response):
+            def execute():
+                started[name].set()
+
+                if not release.wait(timeout=5):
+                    raise TimeoutError(f"{name} service was not released")
+
+                return response
+
+            return execute
+
+        tasks = {
+            "balance": service_call("balance", {"currency": "KES", "available": 12500}),
+            "profile": service_call("profile", {"customer_id": "C102", "kyc": "verified"}),
+            "loan": service_call("loan", {"eligible": True, "limit": 50000}),
+        }
+
+        processor = ConcurrentBatchProcessor(max_workers=3)
+
+        with ThreadPoolExecutor(max_workers=1) as runner:
+            future = runner.submit(processor.process, tasks)
+
+            try:
+                for name, event in started.items():
+                    self.assertTrue(
+                        event.wait(timeout=2),
+                        f"{name} did not start concurrently",
+                    )
+            finally:
+                release.set()
+
+            results = future.result(timeout=2)
+
+        self.assertEqual(
+            results,
+            {
+                "balance": {
+                    "status": "success",
+                    "result": {"currency": "KES", "available": 12500},
+                },
+                "profile": {
+                    "status": "success",
+                    "result": {"customer_id": "C102", "kyc": "verified"},
+                },
+                "loan": {
+                    "status": "success",
+                    "result": {"eligible": True, "limit": 50000},
+                },
+            },
+        )
+
+    # TEST 6 — Partial failure in a payment reconciliation batch
+    def test_payment_reconciliation_partial_failure(self):
+        """
+        One invalid transaction must not prevent valid
+        transactions from being reconciled.
+        """
+        transactions = {
+            "TXN-001": {"amount": 1500, "currency": "KES"},
+            "TXN-002": {"amount": -200, "currency": "KES"},
+            "TXN-003": {"amount": 8500, "currency": "KES"},
+            "TXN-004": {"amount": 0, "currency": "KES"},
+        }
+
+        def reconcile(transaction_id, transaction):
+            def execute():
+                amount = transaction["amount"]
+
+                if amount <= 0:
+                    raise ValueError(f"Invalid amount for {transaction_id}")
+
+                return {
+                    "transaction_id": transaction_id,
+                    "reconciled_amount": amount,
+                }
+
+            return execute
+
+        tasks = {
+            transaction_id: reconcile(transaction_id, transaction)
+            for transaction_id, transaction in transactions.items()
+        }
+
+        processor = ConcurrentBatchProcessor(max_workers=2)
+        results = processor.process(tasks)
+
+        self.assertEqual(
+            results,
+            {
+                "TXN-001": {
+                    "status": "success",
+                    "result": {
+                        "transaction_id": "TXN-001",
+                        "reconciled_amount": 1500,
+                    },
+                },
+                "TXN-002": {
+                    "status": "failed",
+                    "error": "Invalid amount for TXN-002",
+                },
+                "TXN-003": {
+                    "status": "success",
+                    "result": {
+                        "transaction_id": "TXN-003",
+                        "reconciled_amount": 8500,
+                    },
+                },
+                "TXN-004": {
+                    "status": "failed",
+                    "error": "Invalid amount for TXN-004",
+                },
+            },
+        )
+
+    # TEST 7 — Maximum worker concurrency
+    def test_batch_never_exceeds_max_workers(self):
+        """
+        Simulate six independent report-generation jobs.
+
+        With max_workers=2, no more than two tasks may
+        be executing simultaneously.
+        """
+        lock = threading.Lock()
+        release = threading.Event()
+        two_started = threading.Event()
+
+        active = 0
+        peak_active = 0
+
+        def generate_report(report_id):
+            def execute():
+                nonlocal active, peak_active
+
+                with lock:
+                    active += 1
+                    peak_active = max(peak_active, active)
+
+                    if active == 2:
+                        two_started.set()
+
+                try:
+                    if not release.wait(timeout=5):
+                        raise TimeoutError("Report generation not released")
+
+                    return f"report-{report_id}.pdf"
+                finally:
+                    with lock:
+                        active -= 1
+
+            return execute
+
+        tasks = {f"report_{i}": generate_report(i) for i in range(6)}
+
+        processor = ConcurrentBatchProcessor(max_workers=2)
+
+        with ThreadPoolExecutor(max_workers=1) as runner:
+            future = runner.submit(processor.process, tasks)
+
+            try:
+                self.assertTrue(
+                    two_started.wait(timeout=2),
+                    "Two workers did not become active",
+                )
+            finally:
+                release.set()
+
+            results = future.result(timeout=2)
+
+        self.assertEqual(peak_active, 2)
+        self.assertEqual(len(results), 6)
+
+        for i in range(6):
+            self.assertEqual(
+                results[f"report_{i}"],
+                {
+                    "status": "success",
+                    "result": f"report-{i}.pdf",
+                },
+            )
+
+    # TEST 8 — Processor reuse across independent batches
+    def test_processor_can_process_multiple_independent_batches(self):
+        """
+        Simulate reusing a processor for two successive
+        settlement batches.
+
+        Results must not leak between batches.
+        """
+        processor = ConcurrentBatchProcessor(max_workers=2)
+
+        morning_results = processor.process(
+            {
+                "morning_settlement": lambda: {
+                    "batch": "AM",
+                    "total": 150000,
+                },
+            }
+        )
+
+        evening_results = processor.process(
+            {
+                "evening_settlement": lambda: {
+                    "batch": "PM",
+                    "total": 275000,
+                },
+            }
+        )
+
+        self.assertEqual(
+            morning_results,
+            {
+                "morning_settlement": {
+                    "status": "success",
+                    "result": {"batch": "AM", "total": 150000},
+                },
+            },
+        )
+
+        self.assertEqual(
+            evening_results,
+            {
+                "evening_settlement": {
+                    "status": "success",
+                    "result": {"batch": "PM", "total": 275000},
+                },
+            },
+        )
+
+        self.assertNotIn("morning_settlement", evening_results)
+        self.assertNotIn("evening_settlement", morning_results)
+
+    # TEST 9 — Empty batch and no-op processing
+    def test_empty_batch_returns_empty_results(self):
+        """
+        Simulate a scheduled reconciliation job that
+        finds no transactions to process.
+        """
+        processor = ConcurrentBatchProcessor(max_workers=4)
+
+        results = processor.process({})
+
+        self.assertEqual(results, {})
+        self.assertIsInstance(results, dict)
+
+        # The same processor must remain usable afterward.
+        subsequent_results = processor.process(
+            {
+                "health_check": lambda: "healthy",
+            }
+        )
+
+        self.assertEqual(
+            subsequent_results,
+            {
+                "health_check": {
+                    "status": "success",
+                    "result": "healthy",
+                },
+            },
+        )
